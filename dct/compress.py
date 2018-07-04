@@ -130,6 +130,7 @@ def decompress(args):
 	image = np.squeeze(image)
 	if args.display == True:
 		skimage.io.imshow(image)
+		skimage.io.show()
 	if args.output != None:
 		skimage.io.imsave(args.output, image)
 
