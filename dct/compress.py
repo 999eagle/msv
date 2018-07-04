@@ -68,7 +68,7 @@ def compress(args):
 	print('Quantization matrix: ' + str(quant))
 
 	# make sure that image size is integer multiple of BLOCKSIZE
-	image.resize((blocks[0] * BLOCKSIZE, blocks[1] * BLOCKSIZE, image.shape[2]))
+	image = np.resize(image, (blocks[0] * BLOCKSIZE, blocks[1] * BLOCKSIZE, image.shape[2]))
 
 	for x in range(blocks[0]):
 		for y in range(blocks[1]):
@@ -98,11 +98,12 @@ def decompress(args):
 		shape = (x, y, c)
 		print('Image size: ', shape)
 		blocks = np.ceil(np.array(shape[0:2]) / BLOCKSIZE).astype(np.uint8)
+		padded_shape = (blocks[0] * BLOCKSIZE, blocks[1] * BLOCKSIZE, c)
 		print('Block count:', blocks)
 		quant = get_quantization_matrix(quality)
 
-		# create array for final image
-		image = np.empty(shape, dtype = np.float)
+		# create array for final image (including block padding)
+		image = np.empty(padded_shape, dtype = np.float)
 
 		# iterate through blocks
 		for x in range(blocks[0]):
@@ -113,7 +114,7 @@ def decompress(args):
 				bys = y * BLOCKSIZE
 				bye = bys + BLOCKSIZE
 				# create array for block (channel*BLOCKSIZE*BLOCKSIZE)
-				block = np.empty((shape[2], BLOCKSIZE, BLOCKSIZE), dtype = np.float)
+				block = np.empty((shape[2], BLOCKSIZE, BLOCKSIZE), dtype = image.dtype)
 				# iterate through color channels
 				for c in range(shape[2]):
 					# read binary, decompress, reverse dct
@@ -125,6 +126,7 @@ def decompress(args):
 				block = np.moveaxis(block, 0, -1)
 				# write current block to image
 				image[bxs:bxe,bys:bye] = block
+	image = image[0:shape[0],0:shape[1]]
 	image = np.squeeze(image)
 	if args.display == True:
 		skimage.io.imshow(image)
@@ -151,7 +153,7 @@ def dequantize_block(block, quant):
 	# dequantization
 	freq = (block.astype(np.float) * quant) / 50
 	# inverse dct
-	block = fftpack.idctn(freq, type = 3, norm = 'ortho') + 0.5
+	block = fftpack.idctn(freq, type = 2, norm = 'ortho') + 0.5
 	# clip to [0..1]
 	return np.clip(block, 0, 1)
 
