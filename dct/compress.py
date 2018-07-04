@@ -57,6 +57,8 @@ def compress(args):
 	# load input image
 	image = skimage.img_as_float(skimage.io.imread(args.input_file))
 	quality = args.quality
+	if (len(image.shape) == 2): # grayscale image with single channel
+		image = image.reshape((image.shape[0], image.shape[1], 1))
 	# write quality and image size to output file
 	binary_data = struct.pack('>BIIB', quality, image.shape[0], image.shape[1], image.shape[2])
 	print('Input size: ' + str(image.shape))
@@ -81,12 +83,53 @@ def compress(args):
 			block = np.moveaxis(block, -1, 0)
 			# compress color channels separately
 			for i in range(block.shape[0]):
-				compressed = compress_block(quant_reshape_block(block[i], quant))
-				comp_binary = write_compressed_binary(compressed)
-				binary_data += comp_binary
+				# dct, compress, write binary
+				quantized = quantize_block(block[i], quant)
+				reshaped = reshape_block(quantized)
+				compressed = compress_block(reshaped)
+				binary_data += write_compressed_binary(compressed)
 	# write binary data to output file
 	with open(args.output_file, 'wb') as f:
 		f.write(binary_data)
+
+def decompress(args):
+	with open(args.input_file, 'rb') as file:
+		quality, x, y, c = read_and_unpack('>BIIB', file)
+		shape = (x, y, c)
+		print('Image size: ', shape)
+		blocks = np.ceil(np.array(shape[0:2]) / BLOCKSIZE).astype(np.uint8)
+		print('Block count:', blocks)
+		quant = get_quantization_matrix(quality)
+
+		# create array for final image
+		image = np.empty(shape, dtype = np.float)
+
+		# iterate through blocks
+		for x in range(blocks[0]):
+			for y in range(blocks[1]):
+				# calculate block indices
+				bxs = x * BLOCKSIZE
+				bxe = bxs + BLOCKSIZE
+				bys = y * BLOCKSIZE
+				bye = bys + BLOCKSIZE
+				# create array for block (channel*BLOCKSIZE*BLOCKSIZE)
+				block = np.empty((shape[2], BLOCKSIZE, BLOCKSIZE), dtype = np.float)
+				# iterate through color channels
+				for c in range(shape[2]):
+					# read binary, decompress, reverse dct
+					compressed = read_compressed_binary(file)
+					reshaped = decompress_block(compressed)
+					quantized = reverse_reshape_block(reshaped)
+					block[c] = dequantize_block(quantized, quant)
+				# reorder block dimensions to (BLOCKSIZE*BLOCKSIZE*channel)
+				block = np.moveaxis(block, 0, -1)
+				# write current block to image
+				image[bxs:bxe,bys:bye] = block
+	image = np.squeeze(image)
+	if args.display == True:
+		skimage.io.imshow(image)
+	if args.output != None:
+		skimage.io.imsave(args.output, image)
 
 def get_quantization_matrix(quality):
 	if quality < 50:
@@ -98,33 +141,57 @@ def get_quantization_matrix(quality):
 	table[table == 0] = 1
 	return table
 
-def quant_reshape_block(block, quant):
+def quantize_block(block, quant):
 	# dct
 	freq = fftpack.dctn(block - 0.5, type = 2, norm = 'ortho')
 	# quantization
-	freq = np.around((freq * 50) / quant).astype(np.int8)
+	return np.around((freq * 50) / quant).astype(np.int8)
+
+def dequantize_block(block, quant):
+	# dequantization
+	freq = (block.astype(np.float) * quant) / 50
+	# inverse dct
+	block = fftpack.idctn(freq, type = 3, norm = 'ortho') + 0.5
+	# clip to [0..1]
+	return np.clip(block, 0, 1)
+
+def zigzag_coords(x, y, direction):
+	if direction == 1 and (y == 0 or x == BLOCKSIZE - 1):
+		direction = -1
+		if x == BLOCKSIZE - 1:
+			y += 1
+		else:
+			x += 1
+	elif direction == -1 and (x == 0 or y == BLOCKSIZE - 1):
+		direction = 1
+		if y == BLOCKSIZE - 1:
+			x += 1
+		else:
+			y += 1
+	else:
+		x += direction
+		y -= direction
+	return x, y, direction
+
+def reshape_block(block):
 	# reshape into 1D array
-	data = np.empty((BLOCKSIZE * BLOCKSIZE), dtype = freq.dtype)
+	data = np.empty((BLOCKSIZE * BLOCKSIZE), dtype = block.dtype)
 	x, y = 0, 0
 	direction = 1
 	for i in range(len(data)):
-		data[i] = freq[x,y]
-		if direction == 1 and (y == 0 or x == BLOCKSIZE - 1):
-			direction = -1
-			if x == BLOCKSIZE - 1:
-				y += 1
-			else:
-				x += 1
-		elif direction == -1 and (x == 0 or y == BLOCKSIZE - 1):
-			direction = 1
-			if y == BLOCKSIZE - 1:
-				x += 1
-			else:
-				y += 1
-		else:
-			x += direction
-			y -= direction
+		data[i] = block[x, y]
+		x, y, direction = zigzag_coords(x, y, direction)
 	return data
+
+def reverse_reshape_block(data):
+	# reshape data into 2D array
+	block = np.empty((BLOCKSIZE, BLOCKSIZE), dtype = data.dtype)
+	x, y = 0, 0
+	direction = 1
+	for i in range(len(data)):
+		block[x, y] = data[i]
+		x, y, direction = zigzag_coords(x, y, direction)
+	return block
 
 def compress_block(data):
 	# compress with RLE
@@ -135,17 +202,49 @@ def compress_block(data):
 	else:
 		return (compression.RLE, rle)
 
+def decompress_block(data):
+	comp = data[0]
+	data = data[1]
+	if comp == compression.Uncompressed:
+		return data
+	elif comp == compression.RLE:
+		# reverse RLE
+		uncomp = []
+		for length, value in data:
+			uncomp += [value] * length
+		return np.array(uncomp, dtype = data.dtype)
+
 def write_compressed_binary(data):
 	comp = data[0]
 	data = data[1]
+	# write compression type and block length
 	binary = struct.pack('>BB', comp.value, len(data))
 	for i in range(len(data)):
 		if comp == compression.Uncompressed:
+			# write uncompressed data
 			binary += struct.pack('>b', data[i])
 		elif comp == compression.RLE:
+			# write RLE data
 			binary += struct.pack('>Bb', data[i][0], data[i][1])
 	return binary
 
+def read_compressed_binary(file):
+	# read compression type and block length
+	comp, length = read_and_unpack('>BB', file)
+	comp = compression(comp)
+
+	if comp == compression.Uncompressed:
+		# read uncompressed data
+		data = np.empty(length, dtype = np.int8)
+		for i in range(length):
+			data[i], = read_and_unpack('>b', file)
+	elif comp == compression.RLE:
+		# read RLE data
+		data = np.empty((length, 2), dtype = np.int8)
+		for i in range(length):
+			data[i][0], data[i][1] = read_and_unpack('>Bb', file)
+	# return compression type and data
+	return (comp, data)
 
 def read_and_unpack(fmt, file):
 	length = struct.calcsize(fmt)
